@@ -558,6 +558,7 @@ async def downloadAssets(base, base_page_text):
     #     9114: "core"
     # } [e] || e) + ".css"
 
+    # Try the legacy format first (with hash keys: name.hash.js)
     match = re.search(
         r"""
                 "js/"\+ # find js/+  (literal plus)
@@ -574,29 +575,94 @@ async def downloadAssets(base, base_page_text):
         showcase_cont,
         re.X,
     )
-    if match is None:
-        raise Exception("Unable to extract js files and css files from showcase runtime js file")
-    groupDict = match.groupdict()
-    jsNamedDict = extractJSDict("showcase-runtime.js: namedJSFiles", groupDict["namedJSFiles"])
-    jsKeyDict = extractJSDict("showcase-runtime.js: JSFileToKey", groupDict["JSFileToKey"])
-    cssNamedDict = extractJSDict("showcase-runtime.js: namedCSSFiles", groupDict["namedCSSFiles"])
-    cssKeyDict = extractJSDict("showcase-runtime.js: CSSFileToKey", groupDict["CSSFileToKey"])
 
-    for number, key in jsKeyDict.items():
-        name = number
-        if name in jsNamedDict:
-            name = jsNamedDict[name]
-        file = f"js/{name}.{key}.js"
-        typeDict[file] = "SHOWCASE_DISCOVERED_JS"
-        assets.append(file)
+    # Detect the new format where there are no hash keys (name.js / name.css only)
+    # New format: "js/" + ({namedDict}[e] || e) + ".js", l.miniCssF = e => "css/" + ({namedDict}[e] || e) + ".css"
+    new_format = False
+    if match is not None:
+        # Check if JSFileToKey actually contains a valid dict (starts with {)
+        js_key_str = match.groupdict().get("JSFileToKey", "")
+        if "{" not in js_key_str:
+            new_format = True
+    else:
+        new_format = True
 
-    for number, key in cssKeyDict.items():
-        name = number
-        if name in cssNamedDict:
-            name = cssNamedDict[name]
-        file = f"css/{name}.css"  # key is not used for css its just 1 always
-        typeDict[file] = "SHOWCASE_DISCOVERED_CSS"
-        assets.append(file)
+    if new_format:
+        # New format: no hash keys, just named dicts for JS and CSS
+        js_match = re.search(r'"js/"\+\((\{[^}]+\})', showcase_cont)
+        css_match = re.search(r'miniCssF[^"]*"css/"\+\((\{[^}]+\})', showcase_cont)
+        if js_match is None:
+            raise Exception("Unable to extract JS named files dict from showcase runtime js file (new format)")
+
+        jsNamedDict = extractJSDict("showcase-runtime.js: namedJSFiles (new format)", js_match.group(1))
+        cssNamedDict = extractJSDict("showcase-runtime.js: namedCSSFiles (new format)", css_match.group(1)) if css_match else {}
+
+        # Extract all chunk IDs referenced in the runtime and showcase JS files
+        # The named dict tells us some IDs; numbered chunks are referenced via .e(id) in showcase.js
+        all_js_ids = set(jsNamedDict.keys())
+        # Look for patterns like .e(1234) in runtime
+        for m in re.finditer(r'\.e\((\d+)\)', showcase_cont):
+            all_js_ids.add(m.group(1))
+        # Also scan the main showcase.js for .e(id) chunk loading calls
+        # (numbered chunks are typically referenced from showcase.js, not the runtime)
+        showcase_js_filename = None
+        for name in jsNamedDict.values():
+            if 'showcase' in name.lower() and 'runtime' not in name.lower():
+                showcase_js_filename = f"js/{name}.js"
+                break
+        if showcase_js_filename and os.path.exists(showcase_js_filename):
+            with open(showcase_js_filename, "r", encoding="UTF-8") as f:
+                showcase_js_cont = f.read()
+            for m in re.finditer(r'\.e\((\d+)\)', showcase_js_cont):
+                all_js_ids.add(m.group(1))
+        else:
+            # Fallback: also check for showcase.js by known name
+            for candidate in ["js/showcase.js", "js/showcase.modified.js"]:
+                if os.path.exists(candidate):
+                    with open(candidate, "r", encoding="UTF-8") as f:
+                        showcase_js_cont = f.read()
+                    for m in re.finditer(r'\.e\((\d+)\)', showcase_js_cont):
+                        all_js_ids.add(m.group(1))
+                    break
+
+        for number in all_js_ids:
+            name = number
+            if name in jsNamedDict:
+                name = jsNamedDict[name]
+            file = f"js/{name}.js"
+            typeDict[file] = "SHOWCASE_DISCOVERED_JS"
+            assets.append(file)
+
+        all_css_ids = set(cssNamedDict.keys())
+        for number in all_css_ids:
+            name = number
+            if name in cssNamedDict:
+                name = cssNamedDict[name]
+            file = f"css/{name}.css"
+            typeDict[file] = "SHOWCASE_DISCOVERED_CSS"
+            assets.append(file)
+    else:
+        groupDict = match.groupdict()
+        jsNamedDict = extractJSDict("showcase-runtime.js: namedJSFiles", groupDict["namedJSFiles"])
+        jsKeyDict = extractJSDict("showcase-runtime.js: JSFileToKey", groupDict["JSFileToKey"])
+        cssNamedDict = extractJSDict("showcase-runtime.js: namedCSSFiles", groupDict["namedCSSFiles"])
+        cssKeyDict = extractJSDict("showcase-runtime.js: CSSFileToKey", groupDict["CSSFileToKey"])
+
+        for number, key in jsKeyDict.items():
+            name = number
+            if name in jsNamedDict:
+                name = jsNamedDict[name]
+            file = f"js/{name}.{key}.js"
+            typeDict[file] = "SHOWCASE_DISCOVERED_JS"
+            assets.append(file)
+
+        for number, key in cssKeyDict.items():
+            name = number
+            if name in cssNamedDict:
+                name = cssNamedDict[name]
+            file = f"css/{name}.css"  # key is not used for css its just 1 always
+            typeDict[file] = "SHOWCASE_DISCOVERED_CSS"
+            assets.append(file)
 
     for image in image_files:
         if not image.endswith(".jpg") and not image.endswith(".svg"):
@@ -1314,7 +1380,7 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
 
         orig_raw_path = raw_path = self.getRawPath()
         query = self.getQuery()
-        if urlparse(self.path).path == "/api/mp/models/graph":
+        if urlparse(self.path).path in ("/api/mp/models/graph", "/api/mp/accounts/graph"):
             query_args = urllib.parse.parse_qs(query)
             self.do_GraphRequest(query_args.get("operationName", [None])[0])
             return
@@ -1389,6 +1455,13 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
                 logLevel = logging.WARNING
                 post_msg = f"graph for operationName: {option_name} we don't know how to handle, but likely could add support, returning empty instead. If you get an error this may be why (include this message in bug report)."
                 self.wfile.write(bytes('{"data": "empty"}', "utf-8"))
+        else:
+            # Unknown operation - return empty response instead of hanging
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(bytes('{"data": null}', "utf-8"))
+            logLevel = logging.WARNING
+            post_msg = f"graph for unknown operationName: {option_name}, returning null data"
 
         if post_msg is not None:
             consoleDebugLog(f"Handling a graph request on {self.path}: {post_msg}", loglevel=logLevel)
@@ -1397,7 +1470,7 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
         post_msg = None
         logLevel = logging.INFO
         try:
-            if urlparse(self.path).path == "/api/mp/models/graph":
+            if urlparse(self.path).path in ("/api/mp/models/graph", "/api/mp/accounts/graph"):
                 content_len = int(self.headers.get("content-length") or "0")
                 post_body = self.rfile.read(content_len).decode("utf-8")
                 json_body = json.loads(post_body)
